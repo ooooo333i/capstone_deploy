@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+outputs/*
+!outputs/.gitkeep
+
+inputs/checkpoints/**/*
+!inputs/checkpoints/**/
+!inputs/checkpoints/**/.gitkeep
+
+external/hamer/*
+!external/hamer/.gitkeep
