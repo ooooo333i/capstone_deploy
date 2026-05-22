@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-DATA/
+DATA/*
 outputs/*
 !outputs/.gitkeep
 
