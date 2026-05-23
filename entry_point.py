@@ -797,6 +797,7 @@ def run_hamer_from_gvhmr_keypoints(
         from hamer.datasets.vitdet_dataset import ViTDetDataset
         from hamer.models import DEFAULT_CHECKPOINT, download_models, load_hamer
         from hamer.utils import recursive_to
+        from hamer.utils.renderer import cam_crop_to_full
 
         ckpt = str(checkpoint.resolve()) if checkpoint is not None else DEFAULT_CHECKPOINT
         if checkpoint is None and not Path(ckpt).exists():
@@ -856,6 +857,20 @@ def run_hamer_from_gvhmr_keypoints(
                 with torch.no_grad():
                     out = model(batch)
 
+                pred_cam = out["pred_cam"].detach().clone()
+                pred_cam[:, 1] = (2 * batch["right"] - 1) * pred_cam[:, 1]
+                box_center = batch["box_center"].float()
+                box_size = batch["box_size"].float()
+                img_size = batch["img_size"].float()
+                scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
+                pred_cam_t_full = cam_crop_to_full(
+                    pred_cam,
+                    box_center,
+                    box_size,
+                    img_size,
+                    scaled_focal_length,
+                )
+
                 for n in range(batch["img"].shape[0]):
                     person_id = int(batch["personid"][n])
                     right_flag = int(float(batch["right"][n].detach().cpu().numpy()))
@@ -863,6 +878,12 @@ def run_hamer_from_gvhmr_keypoints(
                         out_dir / f"{frame_path.stem}_{person_id}.npz",
                         vertices=out["pred_vertices"][n].detach().cpu().numpy(),
                         cam_t=out["pred_cam_t"][n].detach().cpu().numpy(),
+                        cam_t_full=pred_cam_t_full[n].detach().cpu().numpy(),
+                        pred_cam=pred_cam[n].detach().cpu().numpy(),
+                        box_center=box_center[n].detach().cpu().numpy(),
+                        box_size=box_size[n].detach().cpu().numpy(),
+                        img_size=img_size[n].detach().cpu().numpy(),
+                        focal_length=np.asarray(scaled_focal_length.detach().cpu().item(), dtype=np.float32),
                         mano_params={k: v[n].detach().cpu().numpy() for k, v in out["pred_mano_params"].items()},
                         is_right=right_flag,
                     )
@@ -905,6 +926,16 @@ def hamer_hand_pose_to_axis_angle(hand_pose: Any) -> "Any":
     raise ValueError(f"Unsupported HaMeR hand_pose shape: {arr.shape}")
 
 
+
+
+def mirror_hamer_right_hand_pose_to_left(pose: Any) -> "Any":
+    import numpy as np
+
+    mirrored = np.asarray(pose, dtype=np.float32).reshape(15, 3).copy()
+    mirrored[:, 1:] *= -1.0
+    return mirrored.reshape(45)
+
+
 def load_hamer_hand_detections(hamer_out_dir: Path, num_frames: int) -> dict[str, dict[int, Any]]:
     import numpy as np
 
@@ -922,7 +953,10 @@ def load_hamer_hand_detections(hamer_out_dir: Path, num_frames: int) -> dict[str
             data = np.load(npz_path, allow_pickle=True)
             side = "right" if int(np.asarray(data["is_right"]).reshape(-1)[0]) == 1 else "left"
             mano_params = data["mano_params"].item()
-            detections[side][frame_idx] = hamer_hand_pose_to_axis_angle(mano_params["hand_pose"])
+            pose = hamer_hand_pose_to_axis_angle(mano_params["hand_pose"])
+            if side == "left":
+                pose = mirror_hamer_right_hand_pose_to_left(pose)
+            detections[side][frame_idx] = pose
         except Exception as exc:
             print(f"[CAP] Warning: failed to load {npz_path.name}: {exc}")
 
