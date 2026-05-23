@@ -133,6 +133,13 @@ def main() -> None:
             if prev_area is not None and prev_area > 1e-8:
                 area_jump = float(row["area_frac"] / prev_area)
             previous_area_by_side[side] = row["area_frac"]
+            jump_score = 0.0 if area_jump is None else area_jump / max(args.area_jump_ratio, 1e-8)
+            size_score = max(
+                row["area_frac"] / max(args.area_frac_thresh, 1e-8),
+                row["diag_frac"] / max(args.diag_frac_thresh, 1e-8),
+                row["side_frac"] / max(args.side_frac_thresh, 1e-8),
+                jump_score,
+            )
 
             row.update(
                 {
@@ -141,6 +148,7 @@ def main() -> None:
                     "width": width,
                     "height": height,
                     "area_jump": area_jump,
+                    "size_score": float(size_score),
                     "is_outlier": (
                         row["area_frac"] >= args.area_frac_thresh
                         or row["diag_frac"] >= args.diag_frac_thresh
@@ -151,7 +159,7 @@ def main() -> None:
             )
             rows.append(row)
 
-    top = sorted(rows, key=lambda item: max(item["area_frac"], item["diag_frac"], item["side_frac"]), reverse=True)
+    top = sorted(rows, key=lambda item: item["size_score"], reverse=True)
     outliers = [row for row in rows if row["is_outlier"]]
     report = {
         "base_dir": str(base_dir),
@@ -177,6 +185,7 @@ def main() -> None:
         "diag_frac",
         "side_frac",
         "area_jump",
+        "size_score",
         "crop_frac",
         "bbox_w",
         "bbox_h",
