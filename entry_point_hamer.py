@@ -14,6 +14,7 @@ import entry_point as cap
 
 @dataclass
 class HandPostprocessConfig:
+    post_mode: str = "smooth"
     smooth_sigma: float = 1.0
     gap_max_interp: int = 8
     long_gap_default_weight: float = 0.35
@@ -51,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-result-video", action="store_true", help="Skip the final merged mp4 render.")
     parser.add_argument("--no-interactive", action="store_true", help="Fail instead of prompting for missing values.")
 
+    parser.add_argument(
+        "--hand-post-mode",
+        choices=("smooth", "outlier-only"),
+        default="smooth",
+        help="smooth filters the whole sequence; outlier-only only replaces rejected/missing frames.",
+    )
     parser.add_argument("--hand-smooth-sigma", type=float, default=1.0, help="Gaussian sigma for hand pose smoothing.")
     parser.add_argument("--hand-gap-max-interp", type=int, default=8, help="Max missing gap length to interpolate directly.")
     parser.add_argument(
@@ -266,7 +273,11 @@ def postprocess_hand_sequence(
     outlier = detect_pose_outliers(raw, temporally_valid, cfg)
     valid = temporally_valid & ~outlier
     filled = fill_missing_hand_pose(raw, valid, default_pose, cfg)
-    smoothed = smooth_sequence(filled, cfg.smooth_sigma)
+    if cfg.post_mode == "outlier-only":
+        processed = raw.copy()
+        processed[~valid] = filled[~valid]
+    else:
+        processed = smooth_sequence(filled, cfg.smooth_sigma)
 
     missing = ~detected
     meta = {
@@ -280,7 +291,7 @@ def postprocess_hand_sequence(
         "missing_ranges": [[int(a), int(b)] for a, b in contiguous_ranges(missing)],
         "filled_ranges": [[int(a), int(b)] for a, b in contiguous_ranges(~valid)],
     }
-    return smoothed.astype(np.float32), meta
+    return processed.astype(np.float32), meta
 
 
 def plot_hand_params(out_dir: Path, side: str, raw: Any, processed: Any, detected: Any) -> None:
@@ -544,6 +555,7 @@ def merge_hamer_hands_into_gvhmr_postprocessed(
         "left_hand_frames": side_meta["left"]["detected_frames"],
         "right_hand_frames": side_meta["right"]["detected_frames"],
         "hand_postprocess": {
+            "post_mode": cfg.post_mode,
             "smooth_sigma": cfg.smooth_sigma,
             "gap_max_interp": cfg.gap_max_interp,
             "long_gap_default_weight": cfg.long_gap_default_weight,
@@ -587,6 +599,7 @@ def main() -> None:
     hamer_root = cap.normalize_input_path(args.hamer_root, launch_cwd)
     hamer_checkpoint = cap.normalize_input_path(args.hamer_checkpoint, launch_cwd) if args.hamer_checkpoint else None
     pp_cfg = HandPostprocessConfig(
+        post_mode=args.hand_post_mode,
         smooth_sigma=args.hand_smooth_sigma,
         gap_max_interp=args.hand_gap_max_interp,
         long_gap_default_weight=args.hand_long_gap_default_weight,
