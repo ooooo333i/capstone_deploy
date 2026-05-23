@@ -1,4 +1,5 @@
 import imageio.v3 as iio
+from fractions import Fraction
 import numpy as np
 import torch
 from pathlib import Path
@@ -27,6 +28,13 @@ def get_video_fps(video_path, default=30.0):
 
 def video_fps_matches(video_path, fps, tolerance=0.01):
     return abs(get_video_fps(video_path) - float(fps)) <= tolerance
+
+
+def normalize_video_fps(fps, default=30.0):
+    fps = float(fps)
+    if not np.isfinite(fps) or fps <= 0:
+        fps = float(default)
+    return Fraction(fps).limit_denominator(1000)
 
 
 def read_video_np(video_path, start_frame=0, end_frame=-1, scale=1.0):
@@ -92,7 +100,7 @@ def save_video(images, video_path, fps=30, crf=17):
         images = np.array(images).astype(np.uint8)
 
     with iio.imopen(video_path, "w", plugin="pyav") as writer:
-        writer.init_video_stream("libx264", fps=fps)
+        writer.init_video_stream("libx264", fps=normalize_video_fps(fps))
         writer._video_stream.options = {"crf": str(crf)}
         writer.write(images)
 
@@ -100,7 +108,7 @@ def save_video(images, video_path, fps=30, crf=17):
 def get_writer(video_path, fps=30, crf=17):
     """remember to .close()"""
     writer = iio.imopen(video_path, "w", plugin="pyav")
-    writer.init_video_stream("libx264", fps=fps)
+    writer.init_video_stream("libx264", fps=normalize_video_fps(fps))
     writer._video_stream.options = {"crf": str(crf)}
     return writer
 

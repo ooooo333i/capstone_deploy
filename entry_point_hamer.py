@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hamer-batch-size", type=int, default=1, help="HaMeR inference batch size.")
     parser.add_argument("--hamer-rescale-factor", type=float, default=2.5, help="HaMeR hand crop padding factor.")
     parser.add_argument("--hand-min-conf", type=float, default=0.35, help="Minimum GVHMR/VitPose wrist confidence.")
+    parser.add_argument("--save-hamer-crops", action="store_true", help="Save the actual normalized HaMeR input crops for debugging.")
     parser.add_argument("--skip-result-video", action="store_true", help="Skip the final merged mp4 render.")
     parser.add_argument("--no-interactive", action="store_true", help="Fail instead of prompting for missing values.")
 
@@ -242,6 +243,166 @@ def plot_hand_params(out_dir: Path, side: str, raw: Any, processed: Any, detecte
     plt.close(fig)
 
 
+def save_hamer_input_crops(batch: Any, model_cfg: Any, crops_dir: Path, frame_stem: str) -> None:
+    import cv2
+    import numpy as np
+
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    mean = np.asarray(model_cfg.MODEL.IMAGE_MEAN, dtype=np.float32).reshape(3, 1, 1) * 255.0
+    std = np.asarray(model_cfg.MODEL.IMAGE_STD, dtype=np.float32).reshape(3, 1, 1) * 255.0
+    imgs = batch['img'].detach().cpu().float().numpy()
+    rights = batch['right'].detach().cpu().numpy()
+    personids = batch['personid'].detach().cpu().numpy()
+    box_centers = batch['box_center'].detach().cpu().numpy()
+    box_sizes = batch['box_size'].detach().cpu().numpy()
+
+    for idx in range(imgs.shape[0]):
+        rgb = imgs[idx] * std + mean
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8).transpose(1, 2, 0)
+        bgr = rgb[:, :, ::-1]
+        side = 'right' if int(float(rights[idx])) == 1 else 'left'
+        person_id = int(personids[idx])
+        out_path = crops_dir / f'{frame_stem}_{person_id}_{side}_crop.jpg'
+        cv2.imwrite(str(out_path), bgr)
+
+        meta = {
+            'frame': frame_stem,
+            'person_id': person_id,
+            'side': side,
+            'box_center': [float(v) for v in box_centers[idx].reshape(-1).tolist()],
+            'box_size': float(np.asarray(box_sizes[idx]).reshape(-1)[0]),
+            'crop_file': str(out_path),
+        }
+        (crops_dir / f'{frame_stem}_{person_id}_{side}_crop.json').write_text(
+            json.dumps(meta, indent=2), encoding='utf-8'
+        )
+
+
+def run_hamer_from_gvhmr_keypoints_debug(
+    frame_dir: Path,
+    vitpose_path: Path,
+    out_dir: Path,
+    hamer_root: Path,
+    checkpoint: Path | None,
+    batch_size: int,
+    rescale_factor: float,
+    min_conf: float,
+    force: bool,
+    verbose: bool = False,
+    save_crops: bool = False,
+) -> tuple[Path, dict[str, Any]]:
+    import cv2
+    import numpy as np
+    import torch
+    from tqdm import tqdm
+
+    cap.ensure_hamer_on_path(hamer_root)
+
+    if out_dir.exists() and any(out_dir.glob('*.npz')) and not force:
+        print(f'[CAP] Reusing HaMeR outputs: {out_dir}')
+        return out_dir, {'hamer_sec': 0.0, 'hamer_saved_predictions': 0}
+
+    cap.clear_files(out_dir, ('*.npz', '*.jpg', '*.png', '*.obj'))
+    crops_dir = out_dir / 'input_crops'
+    if save_crops:
+        cap.clear_files(crops_dir, ('*.jpg', '*.json'))
+    hamer_tic = time.perf_counter()
+
+    with cap.temporary_cwd(hamer_root):
+        from hamer.configs import CACHE_DIR_HAMER
+        from hamer.datasets.vitdet_dataset import ViTDetDataset
+        from hamer.models import DEFAULT_CHECKPOINT, download_models, load_hamer
+        from hamer.utils import recursive_to
+        from hamer.utils.renderer import cam_crop_to_full
+
+        ckpt = str(checkpoint.resolve()) if checkpoint is not None else DEFAULT_CHECKPOINT
+        if checkpoint is None and not Path(ckpt).exists():
+            download_models(CACHE_DIR_HAMER)
+
+        model, model_cfg = load_hamer(ckpt)
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        model = model.to(device)
+        model.eval()
+
+        kp2d = cap.torch_load_file(torch, vitpose_path, map_location='cpu')
+        if hasattr(kp2d, 'detach'):
+            kp2d = kp2d.detach().cpu().numpy()
+        else:
+            kp2d = np.asarray(kp2d)
+
+        frame_paths = sorted(frame_dir.glob('*.jpg'))
+        total = min(len(frame_paths), len(kp2d))
+        saved = 0
+        for frame_idx, frame_path in tqdm(list(enumerate(frame_paths[:total])), desc='HaMeR'):
+            img_cv2 = cv2.imread(str(frame_path))
+            if img_cv2 is None:
+                continue
+
+            height, width = img_cv2.shape[:2]
+            boxes, right = cap.estimate_hand_boxes_from_coco17(kp2d[frame_idx], width, height, min_conf)
+            if not boxes:
+                continue
+
+            boxes_np = np.asarray(boxes, dtype=np.float32)
+            right_np = np.asarray(right, dtype=np.float32)
+
+            if verbose:
+                debug_img = img_cv2.copy()
+                for box, right_flag in zip(boxes_np, right_np):
+                    color = (0, 255, 0) if int(right_flag) == 1 else (255, 0, 0)
+                    cv2.rectangle(debug_img, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 2)
+                cv2.imwrite(str(out_dir / f'{frame_path.stem}_bbox.jpg'), debug_img)
+
+            dataset = ViTDetDataset(model_cfg, img_cv2, boxes_np, right_np, rescale_factor=rescale_factor)
+            dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+            for batch in dataloader:
+                if save_crops:
+                    save_hamer_input_crops(batch, model_cfg, crops_dir, frame_path.stem)
+
+                batch = recursive_to(batch, device)
+                with torch.no_grad():
+                    out = model(batch)
+
+                pred_cam = out['pred_cam'].detach().clone()
+                pred_cam[:, 1] = (2 * batch['right'] - 1) * pred_cam[:, 1]
+                box_center = batch['box_center'].float()
+                box_size = batch['box_size'].float()
+                img_size = batch['img_size'].float()
+                scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
+                pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, scaled_focal_length)
+
+                for n in range(batch['img'].shape[0]):
+                    person_id = int(batch['personid'][n])
+                    right_flag = int(float(batch['right'][n].detach().cpu().numpy()))
+                    np.savez(
+                        out_dir / f'{frame_path.stem}_{person_id}.npz',
+                        vertices=out['pred_vertices'][n].detach().cpu().numpy(),
+                        cam_t=out['pred_cam_t'][n].detach().cpu().numpy(),
+                        cam_t_full=pred_cam_t_full[n].detach().cpu().numpy(),
+                        pred_cam=pred_cam[n].detach().cpu().numpy(),
+                        box_center=box_center[n].detach().cpu().numpy(),
+                        box_size=box_size[n].detach().cpu().numpy(),
+                        img_size=img_size[n].detach().cpu().numpy(),
+                        focal_length=np.asarray(scaled_focal_length.detach().cpu().item(), dtype=np.float32),
+                        mano_params={k: v[n].detach().cpu().numpy() for k, v in out['pred_mano_params'].items()},
+                        is_right=right_flag,
+                    )
+                    saved += 1
+
+        if total == 0:
+            raise RuntimeError(f'No frames or keypoints available for HaMeR: {frame_dir}')
+
+        if saved == 0:
+            print('[CAP] Warning: HaMeR produced no hand detections. The merged file will keep GVHMR hand poses.')
+        else:
+            print(f'[CAP] Saved {saved} HaMeR hand predictions to {out_dir}')
+        if save_crops:
+            print(f'[CAP] Saved HaMeR input crops to {crops_dir}')
+
+    return out_dir, {'hamer_sec': time.perf_counter() - hamer_tic, 'hamer_saved_predictions': saved}
+
+
 def merge_hamer_hands_into_gvhmr_postprocessed(
     gvhmr_results: Path,
     hamer_out_dir: Path,
@@ -367,7 +528,7 @@ def main() -> None:
     print(f"[CAP] Prepared {frame_count} frames for HaMeR: {frame_dir}")
 
     hamer_tic = time.perf_counter()
-    cap.run_hamer_from_gvhmr_keypoints(
+    run_hamer_from_gvhmr_keypoints_debug(
         frame_dir=frame_dir,
         vitpose_path=gvhmr_run.vitpose_path,
         out_dir=hamer_out_dir,
@@ -378,6 +539,7 @@ def main() -> None:
         min_conf=args.hand_min_conf,
         force=args.force,
         verbose=args.verbose,
+        save_crops=args.save_hamer_crops,
     )
     hamer_sec = time.perf_counter() - hamer_tic
 

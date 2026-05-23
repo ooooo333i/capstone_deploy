@@ -90,17 +90,28 @@ def parse_args_to_cfg():
 
     # Copy raw-input-video to video_path
     Log.info(f"[Copy Video] {video_path} -> {cfg.video_path}")
-    if (
-        not Path(cfg.video_path).exists()
-        or get_video_lwh(video_path)[0] != get_video_lwh(cfg.video_path)[0]
-        or not video_fps_matches(cfg.video_path, input_fps)
-    ):
+    cached_video_path = Path(cfg.video_path)
+    should_copy_video = not cached_video_path.exists()
+    if not should_copy_video:
+        try:
+            should_copy_video = (
+                get_video_lwh(video_path)[0] != get_video_lwh(cached_video_path)[0]
+                or not video_fps_matches(cached_video_path, input_fps)
+            )
+        except Exception as exc:
+            Log.warning(f"[Copy Video] Existing cached video is unreadable ({exc}); rebuilding it.")
+            cached_video_path.unlink(missing_ok=True)
+            should_copy_video = True
+
+    if should_copy_video:
         reader = get_video_reader(video_path)
         writer = get_writer(cfg.video_path, fps=input_fps, crf=CRF)
-        for img in tqdm(reader, total=get_video_lwh(video_path)[0], desc=f"Copy"):
-            writer.write_frame(img)
-        writer.close()
-        reader.close()
+        try:
+            for img in tqdm(reader, total=length, desc=f"Copy"):
+                writer.write_frame(img)
+        finally:
+            writer.close()
+            reader.close()
 
     return cfg
 
