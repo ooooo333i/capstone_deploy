@@ -8,5 +8,11 @@ inputs/checkpoints/**/*
 !inputs/checkpoints/**/
 !inputs/checkpoints/**/.gitkeep
 
-external/hamer/*
-!external/hamer/.gitkeep
+external/hamer/.git/
+external/hamer/.gitmodules
+external/hamer/**/__pycache__/
+external/hamer/**/*.pyc
+external/hamer/*.egg-info/
+external/hamer/hamer_demo_data.tar.gz
+external/hamer/_DATA/hamer_ckpts/checkpoints/
+external/hamer/_DATA/vitpose_ckpts/
