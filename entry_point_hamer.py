@@ -14,11 +14,14 @@ import entry_point as cap
 
 @dataclass
 class HandPostprocessConfig:
-    smooth_sigma: float = 2.0
+    smooth_sigma: float = 1.0
     gap_max_interp: int = 8
-    long_gap_default_weight: float = 0.85
-    outlier_z: float = 3.5
-    outlier_min_residual: float = 0.35
+    long_gap_default_weight: float = 0.35
+    outlier_z: float = 5.0
+    outlier_min_residual: float = 0.55
+    temporal_gate: bool = True
+    temporal_jump_thresh: float = 0.75
+    temporal_confirm_frames: int = 3
     plot_params: bool = False
 
 
@@ -48,20 +51,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-result-video", action="store_true", help="Skip the final merged mp4 render.")
     parser.add_argument("--no-interactive", action="store_true", help="Fail instead of prompting for missing values.")
 
-    parser.add_argument("--hand-smooth-sigma", type=float, default=2.0, help="Gaussian sigma for hand pose smoothing.")
+    parser.add_argument("--hand-smooth-sigma", type=float, default=1.0, help="Gaussian sigma for hand pose smoothing.")
     parser.add_argument("--hand-gap-max-interp", type=int, default=8, help="Max missing gap length to interpolate directly.")
     parser.add_argument(
         "--hand-long-gap-default-weight",
         type=float,
-        default=0.85,
+        default=0.35,
         help="How strongly long missing gaps move toward the default pose.",
     )
-    parser.add_argument("--hand-outlier-z", type=float, default=3.5, help="Robust z threshold for hand-pose spikes.")
+    parser.add_argument("--hand-outlier-z", type=float, default=5.0, help="Robust z threshold for hand-pose spikes.")
     parser.add_argument(
         "--hand-outlier-min-residual",
         type=float,
-        default=0.35,
+        default=0.55,
         help="Minimum adjacent-frame residual before a detected hand pose can be considered an outlier.",
+    )
+    parser.add_argument(
+        "--hand-temporal-gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reject sudden one-off HaMeR hand-pose jumps and treat them as occluded/missing.",
+    )
+    parser.add_argument(
+        "--hand-jump-thresh",
+        type=float,
+        default=0.75,
+        help="RMS axis-angle jump threshold for temporal hand-pose rejection.",
+    )
+    parser.add_argument(
+        "--hand-jump-confirm-frames",
+        type=int,
+        default=3,
+        help="Accept a large hand-pose change if it stays consistent for this many frames.",
     )
     parser.add_argument("--hand-plot-params", action="store_true", help="Save per-hand parameter plots next to merged output.")
     parser.set_defaults(skip_gvhmr_render=True)
@@ -133,6 +154,50 @@ def detect_pose_outliers(seq: Any, detected: Any, cfg: HandPostprocessConfig) ->
     return outlier
 
 
+def detect_temporal_rejections(seq: Any, detected: Any, cfg: HandPostprocessConfig) -> Any:
+    import numpy as np
+
+    rejected = np.zeros(seq.shape[0], dtype=bool)
+    if not cfg.temporal_gate:
+        return rejected
+
+    confirm_frames = max(1, int(cfg.temporal_confirm_frames))
+    threshold = float(cfg.temporal_jump_thresh)
+    last_valid: Any | None = None
+    pending: list[tuple[int, Any]] = []
+
+    for idx in range(seq.shape[0]):
+        if not detected[idx]:
+            pending.clear()
+            continue
+
+        pose = seq[idx]
+        if last_valid is None:
+            last_valid = pose.copy()
+            pending.clear()
+            continue
+
+        jump = float(np.linalg.norm(pose - last_valid) / np.sqrt(seq.shape[1]))
+        if jump <= threshold:
+            last_valid = pose.copy()
+            pending.clear()
+            continue
+
+        if pending:
+            pending_jump = float(np.linalg.norm(pose - pending[-1][1]) / np.sqrt(seq.shape[1]))
+            if pending_jump > threshold * 0.5:
+                pending = []
+        pending.append((idx, pose.copy()))
+
+        if len(pending) >= confirm_frames:
+            last_valid = pose.copy()
+            pending.clear()
+        else:
+            rejected[idx] = True
+
+    return rejected
+
+
 def fill_missing_hand_pose(seq: Any, valid: Any, default_pose: Any, cfg: HandPostprocessConfig) -> Any:
     import numpy as np
 
@@ -196,16 +261,21 @@ def postprocess_hand_sequence(
             raw[frame_idx] = np.asarray(pose, dtype=np.float32).reshape(45)
             detected[frame_idx] = True
 
-    outlier = detect_pose_outliers(raw, detected, cfg)
-    valid = detected & ~outlier
+    temporal_rejected = detect_temporal_rejections(raw, detected, cfg)
+    temporally_valid = detected & ~temporal_rejected
+    outlier = detect_pose_outliers(raw, temporally_valid, cfg)
+    valid = temporally_valid & ~outlier
     filled = fill_missing_hand_pose(raw, valid, default_pose, cfg)
     smoothed = smooth_sequence(filled, cfg.smooth_sigma)
 
     missing = ~detected
     meta = {
         "detected_frames": int(detected.sum()),
+        "valid_frames_after_temporal_gate": int(temporally_valid.sum()),
         "valid_frames_after_outlier_filter": int(valid.sum()),
         "missing_frames": int(missing.sum()),
+        "temporal_rejected_frames": [int(idx) for idx in np.flatnonzero(temporal_rejected).tolist()],
+        "temporal_rejected_ranges": [[int(a), int(b)] for a, b in contiguous_ranges(temporal_rejected)],
         "outlier_frames": [int(idx) for idx in np.flatnonzero(outlier).tolist()],
         "missing_ranges": [[int(a), int(b)] for a, b in contiguous_ranges(missing)],
         "filled_ranges": [[int(a), int(b)] for a, b in contiguous_ranges(~valid)],
@@ -403,6 +473,18 @@ def run_hamer_from_gvhmr_keypoints_debug(
     return out_dir, {'hamer_sec': time.perf_counter() - hamer_tic, 'hamer_saved_predictions': saved}
 
 
+def smplx_hand_mean_offsets() -> dict[str, Any]:
+    import numpy as np
+
+    from hmr4d.utils.smplx_utils import make_smplx
+
+    smplx = make_smplx("supermotion_fullhands")
+    return {
+        "left": smplx.bm.left_hand_mean.detach().cpu().numpy().astype(np.float32).reshape(45),
+        "right": smplx.bm.right_hand_mean.detach().cpu().numpy().astype(np.float32).reshape(45),
+    }
+
+
 def merge_hamer_hands_into_gvhmr_postprocessed(
     gvhmr_results: Path,
     hamer_out_dir: Path,
@@ -440,13 +522,19 @@ def merge_hamer_hands_into_gvhmr_postprocessed(
             detected[frame_idx] = True
         plot_cache[side] = (raw, processed, detected)
 
+    hand_mean = smplx_hand_mean_offsets()
+    smplx_residual_by_side = {
+        "left": processed_by_side["left"] - hand_mean["left"].reshape(1, 45),
+        "right": processed_by_side["right"] - hand_mean["right"].reshape(1, 45),
+    }
+
     for param_key in ("smpl_params_global", "smpl_params_incam"):
         if param_key not in merged:
             continue
         params = merged[param_key]
         dtype = params["body_pose"].dtype if "body_pose" in params else torch.float32
-        params["left_hand_pose"] = torch.from_numpy(processed_by_side["left"]).to(dtype=dtype)
-        params["right_hand_pose"] = torch.from_numpy(processed_by_side["right"]).to(dtype=dtype)
+        params["left_hand_pose"] = torch.from_numpy(smplx_residual_by_side["left"]).to(dtype=dtype)
+        params["right_hand_pose"] = torch.from_numpy(smplx_residual_by_side["right"]).to(dtype=dtype)
 
     report = {
         "gvhmr_results": str(gvhmr_results),
@@ -461,6 +549,10 @@ def merge_hamer_hands_into_gvhmr_postprocessed(
             "long_gap_default_weight": cfg.long_gap_default_weight,
             "outlier_z": cfg.outlier_z,
             "outlier_min_residual": cfg.outlier_min_residual,
+            "temporal_gate": cfg.temporal_gate,
+            "temporal_jump_thresh": cfg.temporal_jump_thresh,
+            "temporal_confirm_frames": cfg.temporal_confirm_frames,
+            "smplx_hand_mean_subtracted": True,
             "left": side_meta["left"],
             "right": side_meta["right"],
         },
@@ -500,6 +592,9 @@ def main() -> None:
         long_gap_default_weight=args.hand_long_gap_default_weight,
         outlier_z=args.hand_outlier_z,
         outlier_min_residual=args.hand_outlier_min_residual,
+        temporal_gate=args.hand_temporal_gate,
+        temporal_jump_thresh=args.hand_jump_thresh,
+        temporal_confirm_frames=args.hand_jump_confirm_frames,
         plot_params=args.hand_plot_params,
     )
 
