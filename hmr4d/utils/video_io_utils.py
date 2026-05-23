@@ -13,6 +13,22 @@ def get_video_lwh(video_path):
     return L, W, H
 
 
+def get_video_fps(video_path, default=30.0):
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if cap.isOpened():
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps and np.isfinite(fps) and fps > 0:
+                return float(fps)
+    finally:
+        cap.release()
+    return float(default)
+
+
+def video_fps_matches(video_path, fps, tolerance=0.01):
+    return abs(get_video_fps(video_path) - float(fps)) <= tolerance
+
+
 def read_video_np(video_path, start_frame=0, end_frame=-1, scale=1.0):
     """
     Args:
