@@ -7,6 +7,7 @@ from hmr4d.utils.pylogger import Log
 import hydra
 from hydra import initialize_config_module, compose
 from pathlib import Path
+from omegaconf import open_dict
 from pytorch3d.transforms import quaternion_to_matrix
 
 from hmr4d.configs import register_store_gvhmr
@@ -17,6 +18,8 @@ from hmr4d.utils.video_io_utils import (
     merge_videos_horizontal,
     get_writer,
     get_video_reader,
+    get_video_fps,
+    video_fps_matches,
 )
 from hmr4d.utils.vis.cv2_utils import draw_bbx_xyxy_on_image_batch, draw_coco17_skeleton_batch
 
@@ -58,8 +61,9 @@ def parse_args_to_cfg():
     video_path = Path(args.video)
     assert video_path.exists(), f"Video not found at {video_path}"
     length, width, height = get_video_lwh(video_path)
+    input_fps = get_video_fps(video_path)
     Log.info(f"[Input]: {video_path}")
-    Log.info(f"(L, W, H) = ({length}, {width}, {height})")
+    Log.info(f"(L, W, H, FPS) = ({length}, {width}, {height}, {input_fps:.3f})")
     # Cfg
     with initialize_config_module(version_base="1.3", config_module=f"hmr4d.configs"):
         overrides = [
@@ -76,6 +80,8 @@ def parse_args_to_cfg():
             overrides.append(f"output_root={args.output_root}")
         register_store_gvhmr()
         cfg = compose(config_name="demo", overrides=overrides)
+    with open_dict(cfg):
+        cfg.video_fps = input_fps
 
     # Output
     Log.info(f"[Output Dir]: {cfg.output_dir}")
@@ -84,13 +90,28 @@ def parse_args_to_cfg():
 
     # Copy raw-input-video to video_path
     Log.info(f"[Copy Video] {video_path} -> {cfg.video_path}")
-    if not Path(cfg.video_path).exists() or get_video_lwh(video_path)[0] != get_video_lwh(cfg.video_path)[0]:
+    cached_video_path = Path(cfg.video_path)
+    should_copy_video = not cached_video_path.exists()
+    if not should_copy_video:
+        try:
+            should_copy_video = (
+                get_video_lwh(video_path)[0] != get_video_lwh(cached_video_path)[0]
+                or not video_fps_matches(cached_video_path, input_fps)
+            )
+        except Exception as exc:
+            Log.warning(f"[Copy Video] Existing cached video is unreadable ({exc}); rebuilding it.")
+            cached_video_path.unlink(missing_ok=True)
+            should_copy_video = True
+
+    if should_copy_video:
         reader = get_video_reader(video_path)
-        writer = get_writer(cfg.video_path, fps=30, crf=CRF)
-        for img in tqdm(reader, total=get_video_lwh(video_path)[0], desc=f"Copy"):
-            writer.write_frame(img)
-        writer.close()
-        reader.close()
+        writer = get_writer(cfg.video_path, fps=input_fps, crf=CRF)
+        try:
+            for img in tqdm(reader, total=length, desc=f"Copy"):
+                writer.write_frame(img)
+        finally:
+            writer.close()
+            reader.close()
 
     return cfg
 
@@ -118,7 +139,7 @@ def run_preprocess(cfg):
         video = read_video_np(video_path)
         bbx_xyxy = torch.load(paths.bbx)["bbx_xyxy"]
         video_overlay = draw_bbx_xyxy_on_image_batch(bbx_xyxy, video)
-        save_video(video_overlay, cfg.paths.bbx_xyxy_video_overlay)
+        save_video(video_overlay, cfg.paths.bbx_xyxy_video_overlay, fps=getattr(cfg, "video_fps", get_video_fps(video_path)))
 
     # Get VitPose
     if not Path(paths.vitpose).exists():
@@ -132,7 +153,7 @@ def run_preprocess(cfg):
     if verbose:
         video = read_video_np(video_path)
         video_overlay = draw_coco17_skeleton_batch(video, vitpose, 0.5)
-        save_video(video_overlay, paths.vitpose_video_overlay)
+        save_video(video_overlay, paths.vitpose_video_overlay, fps=getattr(cfg, "video_fps", get_video_fps(video_path)))
 
     # Get vit features
     if not Path(paths.vit_features).exists():
@@ -218,9 +239,13 @@ def filter_smplx_params(params):
 
 def render_incam(cfg):
     incam_video_path = Path(cfg.paths.incam_video)
-    if incam_video_path.exists():
+    render_fps = getattr(cfg, "video_fps", get_video_fps(cfg.video_path))
+    if incam_video_path.exists() and video_fps_matches(incam_video_path, render_fps):
         Log.info(f"[Render Incam] Video already exists at {incam_video_path}")
         return
+    if incam_video_path.exists():
+        Log.info(f"[Render Incam] Re-rendering {incam_video_path} to match {render_fps:.3f} FPS")
+        incam_video_path.unlink()
 
     pred = torch.load(cfg.paths.hmr4d_results)
     smplx = make_smplx("supermotion_fullhands").cuda()
@@ -241,7 +266,7 @@ def render_incam(cfg):
     bbx_xys_render = torch.load(cfg.paths.bbx)["bbx_xys"]
 
     # -- render mesh -- #
-    writer = get_writer(incam_video_path, fps=30, crf=CRF)
+    writer = get_writer(incam_video_path, fps=render_fps, crf=CRF)
     for i, img_raw in tqdm(enumerate(reader), total=get_video_lwh(video_path)[0], desc=f"Rendering Incam"):
         img = renderer.render_mesh(verts_incam[i].cuda(), img_raw, [0.8, 0.8, 0.8])
 
@@ -258,9 +283,13 @@ def render_incam(cfg):
 
 def render_global(cfg):
     global_video_path = Path(cfg.paths.global_video)
-    if global_video_path.exists():
+    render_fps = getattr(cfg, "video_fps", get_video_fps(cfg.video_path))
+    if global_video_path.exists() and video_fps_matches(global_video_path, render_fps):
         Log.info(f"[Render Global] Video already exists at {global_video_path}")
         return
+    if global_video_path.exists():
+        Log.info(f"[Render Global] Re-rendering {global_video_path} to match {render_fps:.3f} FPS")
+        global_video_path.unlink()
 
     debug_cam = False
     pred = torch.load(cfg.paths.hmr4d_results)
@@ -308,7 +337,7 @@ def render_global(cfg):
     color = torch.ones(3).float().cuda() * 0.8
 
     render_length = length if not debug_cam else 8
-    writer = get_writer(global_video_path, fps=30, crf=CRF)
+    writer = get_writer(global_video_path, fps=render_fps, crf=CRF)
     for i in tqdm(range(render_length), desc=f"Rendering Global"):
         cameras = renderer.create_camera(global_R[i], global_T[i])
         img = renderer.render_with_ground(verts_glob[[i]], color[None], cameras, global_lights)
@@ -335,13 +364,16 @@ if __name__ == "__main__":
         tic = Log.sync_time()
         pred = model.predict(data, static_cam=cfg.static_cam)
         pred = detach_to_cpu(pred)
-        data_time = data["length"] / 30
+        data_time = data["length"] / getattr(cfg, "video_fps", 30.0)
         Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")
         torch.save(pred, paths.hmr4d_results)
 
     # ===== Render ===== #
     render_incam(cfg)
     render_global(cfg)
-    if not Path(paths.incam_global_horiz_video).exists():
+    if (
+        not Path(paths.incam_global_horiz_video).exists()
+        or not video_fps_matches(paths.incam_global_horiz_video, getattr(cfg, "video_fps", 30.0))
+    ):
         Log.info("[Merge Videos]")
         merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)

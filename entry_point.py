@@ -636,7 +636,7 @@ def run_gvhmr(
         predict_tic = gvhmr_demo.Log.sync_time()
         pred = model.predict(data, static_cam=cfg.static_cam)
         pred = gvhmr_demo.detach_to_cpu(pred)
-        data_time = data["length"] / 30
+        data_time = data["length"] / getattr(cfg, "video_fps", 30.0)
         runtime_report["gvhmr_predict_sec"] = gvhmr_demo.Log.sync_time() - predict_tic
         gvhmr_demo.Log.info(
             f"[CAP] GVHMR elapsed: {runtime_report['gvhmr_predict_sec']:.2f}s for {data_time:.1f}s"
@@ -650,7 +650,7 @@ def run_gvhmr(
         gvhmr_demo.render_incam(cfg)
         gvhmr_demo.render_global(cfg)
         horiz = Path(paths.incam_global_horiz_video)
-        if not horiz.exists():
+        if not horiz.exists() or not gvhmr_demo.video_fps_matches(horiz, getattr(cfg, "video_fps", 30.0)):
             gvhmr_demo.merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
         runtime_report["gvhmr_render_sec"] = time.perf_counter() - render_tic
 
@@ -1040,10 +1040,12 @@ def render_merged_result_video(gvhmr_run: GVHMRRun, merged_path: Path, force: bo
     from tools.demo import demo as gvhmr_demo
 
     output_video = gvhmr_run.output_dir / "smplx_merged_hamer_incam.mp4"
-    if output_video.exists() and not force:
+    render_fps = getattr(gvhmr_run.cfg, "video_fps", gvhmr_demo.get_video_fps(gvhmr_run.video_path))
+    if output_video.exists() and not force and gvhmr_demo.video_fps_matches(output_video, render_fps):
         print(f"[CAP] Reusing merged result video: {output_video}")
         return output_video
     if output_video.exists():
+        print(f"[CAP] Re-rendering merged result video to match {render_fps:.3f} FPS: {output_video}")
         output_video.unlink()
 
     render_cfg = copy.deepcopy(gvhmr_run.cfg)
